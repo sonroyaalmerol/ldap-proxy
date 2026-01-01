@@ -273,33 +273,6 @@ async fn cache_get(
     }
 }
 
-async fn cache_set(
-    cache: &CacheBackend,
-    key: SearchCacheKey,
-    value: CachedValue,
-    redis_prefix: &str,
-    ttl: Option<u64>,
-    tiered_cache: &Option<Arc<TieredCache>>,
-) {
-    match cache {
-        CacheBackend::Memory(mem_cache) => {
-            let mut cache_write = mem_cache.write();
-            if let Some(cache_value_size) = NonZeroUsize::new(value.size()) {
-                debug!("Updating memory cache with entry of size {}", cache_value_size);
-                cache_write.insert_sized(key, value, cache_value_size);
-            } else {
-                error!("Invalid entry size, unable to add to memory cache");
-            }
-        }
-        CacheBackend::Redis(_) => {
-            if let Some(tc) = tiered_cache {
-                tc.set(key, value, redis_prefix, ttl).await;
-                debug!("Updated tiered cache (L1 + L2)");
-            }
-        }
-    }
-}
-
 async fn cache_set_if_changed(
     cache: &CacheBackend,
     key: SearchCacheKey,
