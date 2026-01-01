@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{ReadHalf, WriteHalf};
