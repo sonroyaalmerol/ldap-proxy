@@ -1,10 +1,11 @@
-use crate::{AppState, DnConfig, LdapFilterWrapper};
+use crate::{AppState, CacheBackend, DnConfig, LdapFilterWrapper};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use ldap3_proto::control::LdapControl;
 use ldap3_proto::proto::*;
 use ldap3_proto::LdapCodec;
 use openssl::ssl::{Ssl, SslConnector};
+use redis::AsyncCommands;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -22,16 +23,25 @@ use tracing::{debug, error, info, span, trace, warn, Level};
 type CR = ReadHalf<SslStream<TcpStream>>;
 type CW = WriteHalf<SslStream<TcpStream>>;
 
-#[derive(Debug, Clone, Hash, PartialOrd, Ord, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, PartialOrd, Ord, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SearchCacheKey {
     bind_dn: String,
     search: LdapSearchRequest,
     ctrl: Vec<LdapControl>,
 }
 
-#[derive(Debug, Clone)]
+impl SearchCacheKey {
+    pub fn to_redis_key(&self, prefix: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("{}{:x}", prefix, hasher.finish())
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedValue {
-    pub cached_at: Instant,
+    pub cached_at: std::time::SystemTime,
     pub entries: Vec<(LdapSearchResultEntry, Vec<LdapControl>)>,
     pub result: LdapResult,
     pub ctrl: Vec<LdapControl>,
@@ -40,6 +50,39 @@ pub struct CachedValue {
 impl CachedValue {
     pub fn size(&self) -> usize {
         std::mem::size_of::<Self>() + self.entries.iter().map(|(e, _)| e.size()).sum::<usize>()
+    }
+}
+
+// Cache helper functions
+async fn cache_get(
+    cache: &CacheBackend,
+    key: &SearchCacheKey,
+    redis_prefix: &str,
+) -> Option<CachedValue> {
+    match cache {
+        CacheBackend::Memory(mem_cache) => {
+            let mut cache_read = mem_cache.read();
+            cache_read.get(key).cloned()
+        }
+        CacheBackend::Redis(conn) => {
+            let redis_key = key.to_redis_key(redis_prefix);
+            let mut conn = conn.clone();
+            match conn.get::<_, Vec<u8>>(&redis_key).await {
+                Ok(data) => match serde_json::from_slice::<CachedValue>(&data) {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        error!(?e, "Failed to deserialize cached value from Redis");
+                        None
+                    }
+                },
+                Err(e) => {
+                    if !e.is_nil() {
+                        debug!(?e, "Redis get failed");
+                    }
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -68,6 +111,54 @@ fn bind_operror(msgid: i32, msg: &str) -> LdapMsg {
     }
 }
 
+async fn cache_set(
+    cache: &CacheBackend,
+    key: SearchCacheKey,
+    value: CachedValue,
+    redis_prefix: &str,
+    ttl: Option<u64>,
+) {
+    match cache {
+        CacheBackend::Memory(mem_cache) => {
+            let mut cache_write = mem_cache.write();
+            if let Some(cache_value_size) = NonZeroUsize::new(value.size()) {
+                debug!("Updating memory cache with entry of size {}", cache_value_size);
+                cache_write.insert_sized(key, value, cache_value_size);
+            } else {
+                error!("Invalid entry size, unable to add to memory cache");
+            }
+        }
+        CacheBackend::Redis(conn) => {
+            let redis_key = key.to_redis_key(redis_prefix);
+            let mut conn = conn.clone();
+            match serde_json::to_vec(&value) {
+                Ok(data) => {
+                    let result = if let Some(ttl_seconds) = ttl {
+                        conn.set_ex::<_, _, ()>(&redis_key, data, ttl_seconds).await
+                    } else {
+                        conn.set::<_, _, ()>(&redis_key, data).await
+                    };
+                    
+                    if let Err(e) = result {
+                        error!(?e, "Failed to store value in Redis");
+                    } else {
+                        debug!("Updated Redis cache with entry");
+                    }
+                }
+                Err(e) => {
+                    error!(?e, "Failed to serialize value for Redis");
+                }
+            }
+        }
+    }
+}
+
+async fn cache_try_quiesce(cache: &CacheBackend) {
+    if let CacheBackend::Memory(mem_cache) = cache {
+        mem_cache.try_quiesce();
+    }
+}
+
 pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     mut r: FramedRead<R, LdapCodec>,
     mut w: FramedWrite<W, LdapCodec>,
@@ -81,13 +172,11 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         info!(?client_address, "new client");
     };
 
-    // We always start unbound.
     let mut state = ClientState::Unbound;
+    let redis_prefix = "ldap_proxy:".to_string();
 
-    // Start to wait for incoming packets
     while let Some(Ok(protomsg)) = r.next().await {
         let next_state = match (&mut state, protomsg) {
-            // Doesn't matter what state we are in, any bind will trigger this process.
             (
                 _,
                 LdapMsg {
@@ -100,18 +189,12 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 let _enter = span.enter();
 
                 trace!(?lbr);
-                // Is the requested bind dn valid per our map?
                 let config = match app_state.binddn_map.get(&lbr.dn) {
-                    Some(dnconfig) => {
-                        // They have a config! They can proceed.
-                        dnconfig.clone()
-                    }
+                    Some(dnconfig) => dnconfig.clone(),
                     None => {
                         if app_state.allow_all_bind_dns {
-                            // All bind dns are allow, return a default config.
                             DnConfig::default()
                         } else {
-                            // Bind dns are filtered, sad trombone time.
                             let resp_msg = bind_operror(msgid, "unable to bind");
                             if w.send(resp_msg).await.is_err() {
                                 error!("Unable to send response");
@@ -122,13 +205,8 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     }
                 };
 
-                // Okay, we have a dnconfig, so they are allowed to proceed. Lets
-                // now setup the client for their session, and anything else we
-                // need to configure.
-
                 let dn = lbr.dn.clone();
 
-                // We need the client to connect *and* bind to proceed here!
                 let mut client = match BasicLdapClient::build(
                     &app_state.addrs,
                     &app_state.tls_params,
@@ -143,14 +221,12 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         if w.send(resp_msg).await.is_err() {
                             error!("Unable to send response");
                         }
-                        // Always bail.
                         break;
                     }
                 };
 
                 let valid = match client.bind(lbr, ctrl).await {
                     Ok((bind_resp, ctrl)) => {
-                        // Almost there, lets check the bind result.
                         let valid = bind_resp.res.code == LdapResultCode::Success;
 
                         let resp_msg = LdapMsg {
@@ -170,7 +246,6 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         if w.send(resp_msg).await.is_err() {
                             error!("Unable to send response");
                         }
-                        // Always bail.
                         break;
                     }
                 };
@@ -182,7 +257,6 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     None
                 }
             }
-            // Unbinds are always actioned.
             (
                 _,
                 LdapMsg {
@@ -195,8 +269,6 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 break;
             }
 
-            // Authenticated message handler.
-            //  - Search
             (
                 ClientState::Authenticated {
                     dn,
@@ -212,12 +284,9 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 let span = span!(Level::INFO, "search");
                 let _enter = span.enter();
 
-                // Pre check if the search is allowed for this dn / scope / filter
                 if config.allowed_queries.is_empty() {
-                    // All queries are allowed.
                     debug!("All queries are allowed");
                 } else {
-                    // Let's check the query details.
                     let allow_key = (
                         sr.base.clone(),
                         sr.scope.clone(),
@@ -227,11 +296,9 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     );
 
                     if config.allowed_queries.contains(&allow_key) {
-                        // Good to proceed.
                         debug!("Query is granted");
                     } else {
                         warn!(?allow_key, "Requested query is not allowed for {}", dn);
-                        // If not, send an empty result.
                         if w.send(LdapMsg {
                             msgid,
                             op: LdapOp::SearchResultDone(LdapResult {
@@ -247,12 +314,9 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         {
                             error!("Unable to send response");
                         }
-                        // Always bail.
                         break;
                     }
                 };
-
-                let now = Instant::now();
 
                 let cache_key = SearchCacheKey {
                     bind_dn: dn.clone(),
@@ -261,36 +325,33 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 };
                 debug!(?cache_key);
 
-                // Always try to get fresh data from backend first
                 let (entries, result, ctrl) = match client.search(sr, ctrl).await {
                     Ok(data) => {
                         info!("Backend is reachable, updating fallback cache");
                         let (entries, result, ctrl) = data;
                         
-                        // Update fallback cache with fresh data
-                        let mut cache_write_txn = app_state.cache.write();
                         let cache_value = CachedValue {
-                            cached_at: now,
+                            cached_at: std::time::SystemTime::now(),
                             entries: entries.clone(),
                             result: result.clone(),
                             ctrl: ctrl.clone(),
                         };
                         
-                        if let Some(cache_value_size) = NonZeroUsize::new(cache_value.size()) {
-                            debug!("Updating fallback cache with entry of size {}", cache_value_size);
-                            cache_write_txn.insert_sized(cache_key.clone(), cache_value, cache_value_size);
-                        } else {
-                            error!("Invalid entry size, unable to add to fallback cache");
-                        }
+                        cache_set(
+                            &app_state.cache,
+                            cache_key.clone(),
+                            cache_value,
+                            &redis_prefix,
+                            app_state.cache_ttl,
+                        )
+                        .await;
                         
                         (entries, result, ctrl)
                     }
                     Err(e) => {
                         warn!(?e, "Backend is unreachable, attempting to use fallback cache");
                         
-                        // Try to get from fallback cache
-                        let mut cache_read_txn = app_state.cache.read();
-                        match cache_read_txn.get(&cache_key) {
+                        match cache_get(&app_state.cache, &cache_key, &redis_prefix).await {
                             Some(cached_value) => {
                                 info!("Serving from fallback cache (cached at: {:?})", cached_value.cached_at);
                                 (
@@ -346,13 +407,10 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     break;
                 }
 
-                // Try and quiesce now.
-                app_state.cache.try_quiesce();
+                cache_try_quiesce(&app_state.cache).await;
 
-                // No state change
                 None
             }
-            // Extended Requests - Generally has whoami.
             (
                 ClientState::Authenticated {
                     dn,
@@ -402,16 +460,13 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 
                 None
             }
-            // Unknown message handler.
             (_, msg) => {
                 debug!(?msg);
-                // Return a disconnect.
                 break;
             }
         };
 
         if let Some(next_state) = next_state {
-            // Update the client state, dropping any former state.
             state = next_state;
         }
     }

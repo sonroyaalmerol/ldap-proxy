@@ -3,6 +3,7 @@ use hashbrown::HashSet;
 use ldap3_proto::parse_ldap_filter_str;
 use ldap3_proto::{LdapFilter, LdapSearchScope};
 use openssl::ssl::SslConnector;
+use redis::aio::ConnectionManager;
 use serde::Deserialize;
 use serde_with::DeserializeFromStr;
 use std::collections::BTreeMap;
@@ -17,12 +18,18 @@ use crate::proxy::{CachedValue, SearchCacheKey};
 
 const MEGABYTES: usize = 1048576;
 
+#[derive(Clone)]
+pub enum CacheBackend {
+    Memory(ARCache<SearchCacheKey, CachedValue>),
+    Redis(ConnectionManager),
+}
+
 pub struct AppState {
     pub tls_params: SslConnector,
     pub addrs: Vec<SocketAddr>,
-    // Fallback cache - never expires until backend is reachable
     pub binddn_map: BTreeMap<String, DnConfig>,
-    pub cache: ARCache<SearchCacheKey, CachedValue>,
+    pub cache: CacheBackend,
+    pub cache_ttl: Option<u64>,
     pub max_incoming_ber_size: Option<usize>,
     pub max_proxy_ber_size: Option<usize>,
     pub allow_all_bind_dns: bool,
@@ -61,12 +68,44 @@ pub enum AddrInfoSource {
     ProxyV2,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CacheConfig {
+    Memory {
+        #[serde(default = "default_fallback_cache_bytes")]
+        size_bytes: usize,
+    },
+    Redis {
+        url: String,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+        #[serde(default = "default_redis_key_prefix")]
+        key_prefix: String,
+    },
+}
+
+fn default_redis_key_prefix() -> String {
+    "ldap_proxy:".to_string()
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig::Memory {
+            size_bytes: default_fallback_cache_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub bind: SocketAddr,
     pub tls_key: PathBuf,
     pub tls_chain: PathBuf,
 
+    #[serde(default)]
+    pub cache: CacheConfig,
+
+    // Deprecated: use cache.size_bytes instead
     #[serde(default = "default_fallback_cache_bytes")]
     pub fallback_cache_bytes: usize,
 

@@ -176,10 +176,8 @@ async fn setup(opt: &Opt) {
 
     debug!(?sync_config);
 
-    // Setup the broadcast system.
     let (broadcast_tx, broadcast_rx) = broadcast::channel(1);
 
-    // Let the listening port ready.
     let listener = match TcpListener::bind(&sync_config.bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -190,8 +188,6 @@ async fn setup(opt: &Opt) {
             return;
         }
     };
-
-    // Setup the data for the client handles.
 
     let url = sync_config.ldap_url;
 
@@ -272,18 +268,44 @@ async fn setup(opt: &Opt) {
 
     let tls_params = tls_builder.build();
 
-    let Some(cache) = ARCacheBuilder::new()
-        .set_size(sync_config.fallback_cache_bytes, 0)
-        .build()
-    else {
-        error!("Unable to build fallback cache");
-        return;
-    };
+    // Initialize cache based on configuration
+    let (cache, cache_ttl) = match &sync_config.cache {
+        ldap_proxy::CacheConfig::Memory { size_bytes } => {
+            let Some(cache) = ARCacheBuilder::new().set_size(*size_bytes, 0).build() else {
+                error!("Unable to build memory cache");
+                return;
+            };
+            info!("Memory cache configured with {} bytes", size_bytes);
+            (ldap_proxy::CacheBackend::Memory(cache), None)
+        }
+        ldap_proxy::CacheConfig::Redis {
+            url,
+            ttl_seconds,
+            key_prefix: _,
+        } => {
+            let client = match redis::Client::open(url.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(?e, "Unable to create Redis client");
+                    return;
+                }
+            };
 
-    info!(
-        "Fallback cache configured with {} bytes",
-        sync_config.fallback_cache_bytes
-    );
+            let conn_manager = match redis::aio::ConnectionManager::new(client).await {
+                Ok(cm) => cm,
+                Err(e) => {
+                    error!(?e, "Unable to connect to Redis");
+                    return;
+                }
+            };
+
+            info!(
+                "Redis cache configured at {} with TTL: {:?}",
+                url, ttl_seconds
+            );
+            (ldap_proxy::CacheBackend::Redis(conn_manager), *ttl_seconds)
+        }
+    };
 
     let max_incoming_ber_size = sync_config.max_incoming_ber_size;
     let max_proxy_ber_size = sync_config.max_proxy_ber_size;
@@ -295,6 +317,7 @@ async fn setup(opt: &Opt) {
         addrs,
         binddn_map: sync_config.binddn_map.clone(),
         cache,
+        cache_ttl,
         max_incoming_ber_size,
         max_proxy_ber_size,
         allow_all_bind_dns,
@@ -325,15 +348,12 @@ async fn setup(opt: &Opt) {
         return;
     }
 
-    // Done!
     let tls_server_params = tls_builder.build();
 
-    // Setup the acceptor.
     let acceptor = tokio::spawn(async move {
         ldaps_acceptor(listener, tls_server_params, broadcast_rx, app_state).await
     });
 
-    // Finally, block on the signal handler.
     loop {
         tokio::select! {
             Ok(()) = tokio::signal::ctrl_c() => {
@@ -377,12 +397,10 @@ async fn setup(opt: &Opt) {
         }
     }
     info!("Signal received, sending down signal to tasks");
-    // Send a broadcast that we are done.
     if let Err(e) = broadcast_tx.send(true) {
         error!("Unable to shutdown workers {:?}", e);
     }
 
-    // Wait for tasks to join.
     let _ = acceptor.await;
 }
 

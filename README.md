@@ -1,6 +1,6 @@
 # Ldap Proxy
 
-A fast, simple, in-memory fallback proxy for LDAP that provides high availability and allows limiting of DNs and their searches.
+A fast, simple, fallback proxy for LDAP that provides high availability and allows limiting of DNs and their searches.
 
 ## Overview
 
@@ -10,12 +10,15 @@ ldap-proxy acts as a transparent LDAP proxy with automatic fallback capabilities
 
 - **Transparent Proxying**: All requests are forwarded to the upstream LDAP server when available
 - **Automatic Fallback**: Seamlessly serves cached data when the backend is unreachable
-- **No Cache Expiration**: Fallback data never expires until replaced with fresh data from the backend
+- **No Cache Expiration**: Fallback data never expires until replaced with fresh data from the backend (memory cache) or TTL expires (Redis cache)
+- **Flexible Cache Backends**: Choose between in-memory cache or Redis for distributed deployments
 - **LDAP Firewall**: Filter which DNs can bind and what queries they may perform
-- **High Performance**: In-memory cache with configurable size limits
+- **High Performance**: Configurable cache with size limits (memory) or TTL (Redis)
 - **TLS/LDAPS Support**: Secure connections for both client and upstream server
 
 ## Configuration
+
+### Basic Configuration (Memory Cache)
 
 ```toml
 # /data/config.toml for containers.
@@ -25,9 +28,10 @@ bind = "127.0.0.1:3636"
 tls_chain = "/tmp/chain.pem"
 tls_key = "/tmp/key.pem"
 
-# Number of bytes to allocate for the fallback cache
-# Default: 268435456 (256 MB)
-# fallback_cache_bytes = 268435456
+# Cache configuration - Memory backend (default)
+[cache]
+type = "memory"
+size_bytes = 268435456  # 256 MB (default)
 
 # The max ber size of requests from clients
 # max_incoming_ber_size = 8388608
@@ -75,6 +79,81 @@ allowed_queries = [
 ]
 ```
 
+### Redis Cache Configuration
+
+For distributed deployments or when you need cache persistence across restarts:
+
+```toml
+bind = "127.0.0.1:3636"
+tls_chain = "/tmp/chain.pem"
+tls_key = "/tmp/key.pem"
+
+# Cache configuration - Redis backend
+[cache]
+type = "redis"
+url = "redis://localhost:6379"
+# Optional: TTL in seconds for cache entries (if not set, entries don't expire)
+ttl_seconds = 3600  # 1 hour
+# Optional: Custom prefix for Redis keys (default: "ldap_proxy:")
+key_prefix = "ldap_proxy:"
+
+ldap_ca = "/tmp/ldap-ca.pem"
+ldap_url = "ldaps://idm.example.com"
+
+# ... rest of configuration same as memory cache
+```
+
+#### Redis Configuration Options
+
+- **url**: Redis connection URL. Supports:
+  - `redis://host:port` - Standard TCP connection
+  - `redis://host:port/db` - Specific database number
+  - `rediss://host:port` - TLS connection
+  - `redis+unix:///path/to/socket` - Unix socket connection
+  
+- **ttl_seconds** (optional): Time-to-live for cache entries. If not set, entries persist indefinitely (similar to memory cache behavior). Useful for ensuring data freshness.
+
+- **key_prefix** (optional): Prefix for all Redis keys. Default is `ldap_proxy:`. Useful when sharing a Redis instance with other applications.
+
+## Cache Backend Comparison
+
+### Memory Cache
+
+**Pros:**
+- Fastest performance (no network overhead)
+- Simple configuration
+- No external dependencies
+
+**Cons:**
+- Cache lost on restart
+- Limited to single instance
+- Memory usage on the proxy server
+
+**Best for:**
+- Single instance deployments
+- When maximum performance is critical
+- Simple setups without high availability requirements
+
+### Redis Cache
+
+**Pros:**
+- Cache persists across restarts (with Redis persistence enabled)
+- Shared cache across multiple proxy instances
+- Optional TTL for automatic data freshness
+- Offloads memory usage from proxy servers
+- Better for horizontal scaling
+
+**Cons:**
+- Network latency for cache operations
+- Additional infrastructure (Redis server)
+- More complex setup
+
+**Best for:**
+- Multi-instance deployments
+- When cache persistence is important
+- Load-balanced setups with multiple proxies
+- When you need guaranteed data freshness (via TTL)
+
 ## How It Works
 
 1. **Normal Operation**: When the backend LDAP server is reachable:
@@ -104,23 +183,64 @@ allowed_queries = [
 - **Network Resilience**: Handle temporary network partitions gracefully
 - **Security Filtering**: Control which DNs can authenticate and what they can query
 - **Multi-Tenant Environments**: Isolate different applications with specific query permissions
+- **Distributed Deployments**: Use Redis cache for load-balanced proxy instances
+- **Cache Persistence**: Maintain cache across proxy restarts with Redis
+
+## Deployment Patterns
+
+### Single Instance (Memory Cache)
+
+```
+┌──────────┐         ┌─────────────┐         ┌──────────────┐
+│  Client  │ ──────▶ │ ldap-proxy  │ ──────▶ │ LDAP Backend │
+└──────────┘         │ (memory)    │         └──────────────┘
+                     └─────────────┘
+```
+
+Simple, high-performance setup for single proxy deployments.
+
+### Load Balanced (Redis Cache)
+
+```
+                     ┌─────────────┐
+                  ┌─▶│ ldap-proxy  │─┐
+┌──────────┐     │  │  (instance1) │ │      ┌──────────────┐
+│  Client  │ ────┤  └─────────────┘ ├────▶ │ LDAP Backend │
+└──────────┘     │  ┌─────────────┐ │      └──────────────┘
+                  └─▶│ ldap-proxy  │─┘
+                     │  (instance2) │
+                     └─────────────┘
+                            │
+                            ▼
+                     ┌─────────────┐
+                     │    Redis    │
+                     │   (shared)  │
+                     └─────────────┘
+```
+
+Shared cache across multiple proxy instances for high availability and horizontal scaling.
 
 ## FAQ
 
 ### How long does cached data remain valid?
 
-Cached data never expires. It remains in the fallback cache until:
+**Memory Cache**: Cached data never expires. It remains in the fallback cache until:
 - The backend becomes reachable again and provides fresh data
 - The cache fills up and older entries are evicted (LRU policy)
 - The service is restarted
+
+**Redis Cache**: Depends on configuration:
+- With `ttl_seconds` set: Entries expire after the specified duration
+- Without `ttl_seconds`: Similar to memory cache, entries persist until replaced
+- Redis persistence configuration determines survival across Redis restarts
 
 ### What happens when the backend is down and there's no cached data?
 
 If a query is performed while the backend is unreachable and there's no cached data for that specific query, ldap-proxy will return an `Unavailable` error with the message "Backend LDAP server unavailable and no cached data".
 
-### How much memory should I allocate for the fallback cache?
+### How much memory/cache should I allocate?
 
-This depends on:
+**Memory Cache**: This depends on:
 - The number of unique queries your applications perform
 - The size of search results (number of entries and attributes)
 - Your desired coverage during outages
@@ -130,7 +250,34 @@ The default is 256 MB. For production environments, consider:
 - Medium deployments: 512 MB - 2 GB
 - Large deployments: 2 GB - 8 GB+
 
+**Redis Cache**: Size is limited by your Redis server configuration. Consider:
+- Redis maxmemory setting
+- Redis eviction policy (e.g., `allkeys-lru`)
+- Use `ttl_seconds` to automatically expire old entries
+
 Monitor your cache hit rate and adjust accordingly.
+
+### Should I use memory cache or Redis cache?
+
+Choose **memory cache** if:
+- You're running a single proxy instance
+- Maximum performance is critical
+- You don't need cache persistence across restarts
+- You want simpler setup and maintenance
+
+Choose **Redis cache** if:
+- You're running multiple proxy instances behind a load balancer
+- You need cache persistence across proxy restarts
+- You want to offload memory usage from proxy servers
+- You need guaranteed data freshness via TTL
+- You're already running Redis infrastructure
+
+### Can multiple proxy instances share a Redis cache?
+
+Yes! This is one of the primary benefits of using Redis. Multiple ldap-proxy instances can share the same Redis cache, providing:
+- Consistent cache hits across all instances
+- Reduced load on the backend LDAP server
+- Better resource utilization
 
 ### Why can't ldap-proxy running under systemd read my certificates?
 
@@ -152,6 +299,11 @@ directory paths and that the certs are readable to the group!
 
 While ldap-proxy does cache results, it always attempts to query the backend first. It's designed primarily as a fallback/high-availability solution rather than a performance optimization cache. The caching is a side effect of the fallback mechanism.
 
+However, with Redis cache and TTL configured, you can achieve some load reduction:
+- Cache hits across multiple proxy instances reduce backend queries
+- TTL prevents constant backend queries for the same data within the TTL window
+- During backend outages, all load is served from cache
+
 ### Does ldap-proxy support HAProxy PROXY protocol?
 
 Yes! Set `remote_ip_addr_info = "ProxyV2"` in your configuration to enable PROXY protocol v2 support. This allows ldap-proxy to receive the real client IP address when running behind HAProxy or similar load balancers.
@@ -164,3 +316,23 @@ Yes! Set `remote_ip_addr_info = "ProxyV2"` in your configuration to enable PROXY
 - Extended operations (WhoAmI)
 
 Modify operations (add, delete, modify, modifyDN) are not supported as ldap-proxy is designed as a read-only proxy.
+
+### How do I monitor cache performance?
+
+Monitor the logs for:
+- "Backend is reachable, updating fallback cache" - Cache is being populated
+- "Serving from fallback cache" - Cache hits during backend outages
+- "Backend unreachable and no fallback data available" - Cache misses
+
+For Redis, you can also use Redis monitoring tools:
+- `redis-cli INFO stats` - See hit/miss ratios
+- `redis-cli KEYS ldap_proxy:*` - List cached entries
+- Monitor memory usage with `redis-cli INFO memory`
+
+### Can I pre-populate the cache?
+
+Not directly, but you can:
+1. Start ldap-proxy with the backend available
+2. Execute typical queries your applications will use
+3. The cache will be populated with these results
+4. For Redis: If configured without TTL, this cache persists across proxy restarts
