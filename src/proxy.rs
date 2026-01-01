@@ -78,6 +78,13 @@ fn bind_operror(msgid: i32, msg: &str) -> LdapMsg {
     }
 }
 
+// Tiered cache structure for Redis backend
+struct TieredCache {
+    l1_cache: Arc<Mutex<HashMap<SearchCacheKey, CachedValue>>>,
+    redis_conn: redis::aio::ConnectionManager,
+    max_l1_size: usize,
+}
+
 impl TieredCache {
     fn new(
         redis_conn: redis::aio::ConnectionManager,
