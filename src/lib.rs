@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use url::Url;
 
 pub mod proxy;
@@ -19,7 +20,7 @@ use crate::proxy::{CachedValue, SearchCacheKey};
 const MEGABYTES: usize = 1048576;
 
 pub enum CacheBackend {
-    Memory(ARCache<SearchCacheKey, CachedValue>),
+    Memory(Arc<ARCache<SearchCacheKey, CachedValue>>),
     Redis(ConnectionManager),
 }
 
