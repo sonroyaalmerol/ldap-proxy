@@ -18,7 +18,6 @@ use crate::proxy::{CachedValue, SearchCacheKey};
 
 const MEGABYTES: usize = 1048576;
 
-#[derive(Clone)]
 pub enum CacheBackend {
     Memory(ARCache<SearchCacheKey, CachedValue>),
     Redis(ConnectionManager),

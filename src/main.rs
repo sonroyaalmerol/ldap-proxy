@@ -276,7 +276,7 @@ async fn setup(opt: &Opt) {
                 return;
             };
             info!("Memory cache configured with {} bytes", size_bytes);
-            (ldap_proxy::CacheBackend::Memory(cache), None)
+            (ldap_proxy::CacheBackend::Memory(Arc::new(cache)), None)
         }
         ldap_proxy::CacheConfig::Redis {
             url,

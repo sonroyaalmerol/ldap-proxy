@@ -12,7 +12,6 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -53,39 +52,6 @@ impl CachedValue {
     }
 }
 
-// Cache helper functions
-async fn cache_get(
-    cache: &CacheBackend,
-    key: &SearchCacheKey,
-    redis_prefix: &str,
-) -> Option<CachedValue> {
-    match cache {
-        CacheBackend::Memory(mem_cache) => {
-            let mut cache_read = mem_cache.read();
-            cache_read.get(key).cloned()
-        }
-        CacheBackend::Redis(conn) => {
-            let redis_key = key.to_redis_key(redis_prefix);
-            let mut conn = conn.clone();
-            match conn.get::<_, Vec<u8>>(&redis_key).await {
-                Ok(data) => match serde_json::from_slice::<CachedValue>(&data) {
-                    Ok(value) => Some(value),
-                    Err(e) => {
-                        error!(?e, "Failed to deserialize cached value from Redis");
-                        None
-                    }
-                },
-                Err(e) => {
-                    if !e.is_nil() {
-                        debug!(?e, "Redis get failed");
-                    }
-                    None
-                }
-            }
-        }
-    }
-}
-
 enum ClientState {
     Unbound,
     Authenticated {
@@ -108,6 +74,43 @@ fn bind_operror(msgid: i32, msg: &str) -> LdapMsg {
             saslcreds: None,
         }),
         ctrl: vec![],
+    }
+}
+
+async fn cache_get(
+    cache: &CacheBackend,
+    key: &SearchCacheKey,
+    redis_prefix: &str,
+) -> Option<CachedValue> {
+    match cache {
+        CacheBackend::Memory(mem_cache) => {
+            let mut cache_read = mem_cache.read();
+            cache_read.get(key).cloned()
+        }
+        CacheBackend::Redis(conn) => {
+            let redis_key = key.to_redis_key(redis_prefix);
+            let mut conn = conn.clone();
+            match conn.get::<_, Vec<u8>>(&redis_key).await {
+                Ok(data) => match serde_json::from_slice::<CachedValue>(&data) {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        error!(?e, "Failed to deserialize cached value from Redis");
+                        None
+                    }
+                },
+                Err(e) => {
+                    match e.kind() {
+                        redis::ErrorKind::TypeError => {
+                            // Key doesn't exist, this is expected
+                        }
+                        _ => {
+                            debug!(?e, "Redis get failed");
+                        }
+                    }
+                    None
+                }
+            }
+        }
     }
 }
 
