@@ -77,38 +77,130 @@ fn bind_operror(msgid: i32, msg: &str) -> LdapMsg {
     }
 }
 
+// Tiered cache structure for Redis backend
+struct TieredCache {
+    l1_cache: quick_cache::sync::Cache<SearchCacheKey, CachedValue>,
+    redis_conn: redis::aio::MultiplexedConnection,
+}
+
+impl TieredCache {
+    fn new(
+        redis_conn: redis::aio::MultiplexedConnection,
+        max_l1_size: usize,
+    ) -> Self {
+        Self {
+            l1_cache: quick_cache::sync::Cache::new(max_l1_size),
+            redis_conn,
+        }
+    }
+
+    async fn get(
+        &self,
+        key: &SearchCacheKey,
+        redis_prefix: &str,
+    ) -> Option<CachedValue> {
+        // Check L1 cache first
+        if let Some(value) = self.l1_cache.get(key) {
+            trace!("L1 cache hit");
+            return Some(value);
+        }
+
+        // L1 miss, check Redis (L2)
+        let redis_key = key.to_redis_key(redis_prefix);
+        let mut conn = self.redis_conn.clone();
+        
+        match conn.get::<_, Vec<u8>>(&redis_key).await {
+            Ok(data) => match serde_json::from_slice::<CachedValue>(&data) {
+                Ok(value) => {
+                    trace!("L2 (Redis) cache hit, promoting to L1");
+                    // Promote to L1 cache
+                    if let Some(size) = NonZeroUsize::new(value.size()) {
+                        self.l1_cache.insert_sized(key.clone(), value.clone(), size);
+                    }
+                    Some(value)
+                }
+                Err(e) => {
+                    error!(?e, "Failed to deserialize cached value from Redis");
+                    None
+                }
+            },
+            Err(e) => {
+                match e.kind() {
+                    redis::ErrorKind::TypeError => {
+                        trace!("Cache miss on both L1 and L2");
+                    }
+                    _ => {
+                        debug!(?e, "Redis get failed");
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    async fn set(
+        &self,
+        key: SearchCacheKey,
+        value: CachedValue,
+        redis_prefix: &str,
+        ttl: Option<u64>,
+    ) {
+        // Write to L1 cache immediately
+        if let Some(size) = NonZeroUsize::new(value.size()) {
+            self.l1_cache.insert_sized(key.clone(), value.clone(), size);
+        }
+
+
+        // Write to Redis synchronously but with timeout
+        let redis_key = key.to_redis_key(redis_prefix);
+        let mut conn = self.redis_conn.clone();
+        
+        let timeout = Duration::from_millis(200);
+        let redis_write = async {
+            match serde_json::to_vec(&value) {
+                Ok(data) => {
+                    let result = if let Some(ttl_seconds) = ttl {
+                        conn.set_ex::<_, _, ()>(&redis_key, data, ttl_seconds)
+                            .await
+                    } else {
+                        conn.set::<_, _, ()>(&redis_key, data).await
+                    };
+                    
+                    if let Err(e) = result {
+                        debug!(?e, "Redis write failed");
+                    } else {
+                        trace!("Redis write completed");
+                    }
+                }
+                Err(e) => {
+                    error!(?e, "Failed to serialize for Redis");
+                }
+            }
+        };
+
+        // Wait for Redis write with timeout
+        if tokio::time::timeout(timeout, redis_write).await.is_err() {
+            warn!("Redis write timed out, continuing anyway");
+        }
+    }
+}
+
 async fn cache_get(
     cache: &CacheBackend,
     key: &SearchCacheKey,
     redis_prefix: &str,
+    tiered_cache: &Option<Arc<TieredCache>>,
 ) -> Option<CachedValue> {
     match cache {
         CacheBackend::Memory(mem_cache) => {
             let mut cache_read = mem_cache.read();
             cache_read.get(key).cloned()
         }
-        CacheBackend::Redis(conn) => {
-            let redis_key = key.to_redis_key(redis_prefix);
-            let mut conn = conn.clone();
-            match conn.get::<_, Vec<u8>>(&redis_key).await {
-                Ok(data) => match serde_json::from_slice::<CachedValue>(&data) {
-                    Ok(value) => Some(value),
-                    Err(e) => {
-                        error!(?e, "Failed to deserialize cached value from Redis");
-                        None
-                    }
-                },
-                Err(e) => {
-                    match e.kind() {
-                        redis::ErrorKind::TypeError => {
-                            // Key doesn't exist, this is expected
-                        }
-                        _ => {
-                            debug!(?e, "Redis get failed");
-                        }
-                    }
-                    None
-                }
+        CacheBackend::Redis(_) => {
+            if let Some(tc) = tiered_cache {
+                tc.get(key, redis_prefix).await
+            } else {
+                None
             }
         }
     }
@@ -120,6 +212,7 @@ async fn cache_set(
     value: CachedValue,
     redis_prefix: &str,
     ttl: Option<u64>,
+    tiered_cache: &Option<Arc<TieredCache>>,
 ) {
     match cache {
         CacheBackend::Memory(mem_cache) => {
@@ -131,26 +224,10 @@ async fn cache_set(
                 error!("Invalid entry size, unable to add to memory cache");
             }
         }
-        CacheBackend::Redis(conn) => {
-            let redis_key = key.to_redis_key(redis_prefix);
-            let mut conn = conn.clone();
-            match serde_json::to_vec(&value) {
-                Ok(data) => {
-                    let result = if let Some(ttl_seconds) = ttl {
-                        conn.set_ex::<_, _, ()>(&redis_key, data, ttl_seconds).await
-                    } else {
-                        conn.set::<_, _, ()>(&redis_key, data).await
-                    };
-                    
-                    if let Err(e) = result {
-                        error!(?e, "Failed to store value in Redis");
-                    } else {
-                        debug!("Updated Redis cache with entry");
-                    }
-                }
-                Err(e) => {
-                    error!(?e, "Failed to serialize value for Redis");
-                }
+        CacheBackend::Redis(_) => {
+            if let Some(tc) = tiered_cache {
+                tc.set(key, value, redis_prefix, ttl).await;
+                debug!("Updated tiered cache (L1 + L2)");
             }
         }
     }
@@ -177,6 +254,15 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 
     let mut state = ClientState::Unbound;
     let redis_prefix = "ldap_proxy:".to_string();
+
+    // Initialize tiered cache if using Redis backend
+    let tiered_cache = match &app_state.cache {
+        CacheBackend::Redis(conn) => {
+            // L1 cache size: 1000 entries (adjust as needed)
+            Some(Arc::new(TieredCache::new(conn.clone(), 1000)))
+        }
+        _ => None,
+    };
 
     while let Some(Ok(protomsg)) = r.next().await {
         let next_state = match (&mut state, protomsg) {
@@ -346,6 +432,7 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                             cache_value,
                             &redis_prefix,
                             app_state.cache_ttl,
+                            &tiered_cache,
                         )
                         .await;
                         
@@ -354,7 +441,7 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     Err(e) => {
                         warn!(?e, "Backend is unreachable, attempting to use fallback cache");
                         
-                        match cache_get(&app_state.cache, &cache_key, &redis_prefix).await {
+                        match cache_get(&app_state.cache, &cache_key, &redis_prefix, &tiered_cache).await {
                             Some(cached_value) => {
                                 info!("Serving from fallback cache (cached at: {:?})", cached_value.cached_at);
                                 (
