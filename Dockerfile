@@ -1,4 +1,4 @@
-FROM rust:1.84-trixie AS builder
+FROM rust:trixie AS builder
 
 ARG TARGETARCH
 ARG SCCACHE_REDIS
