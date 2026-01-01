@@ -1,20 +1,15 @@
-FROM debian:trixie-slim AS build_base
+FROM rust:1.84-trixie AS builder
+
+ARG TARGETARCH
+ARG SCCACHE_REDIS
 
 RUN apt-get update && apt-get install -y \
-    cargo \
-    rustc \
-    gcc \
     libssl-dev \
     pkg-config \
     perl \
     make \
     gawk \
     && rm -rf /var/lib/apt/lists/*
-
-FROM build_base AS builder
-
-ARG TARGETARCH
-ARG SCCACHE_REDIS
 
 COPY . /home/proxy/
 WORKDIR /home/proxy

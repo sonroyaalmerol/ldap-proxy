@@ -78,13 +78,6 @@ fn bind_operror(msgid: i32, msg: &str) -> LdapMsg {
     }
 }
 
-// Tiered cache structure for Redis backend
-struct TieredCache {
-    l1_cache: Arc<Mutex<HashMap<SearchCacheKey, CachedValue>>>,
-    redis_conn: redis::aio::ConnectionManager,
-    max_l1_size: usize,
-}
-
 impl TieredCache {
     fn new(
         redis_conn: redis::aio::ConnectionManager,
@@ -206,6 +199,50 @@ impl TieredCache {
             warn!("Redis write timed out, continuing with L1 cache only");
         }
     }
+
+    async fn set_if_changed(
+        &self,
+        key: SearchCacheKey,
+        value: CachedValue,
+        redis_prefix: &str,
+        ttl: Option<u64>,
+    ) {
+        // Check if data has changed by comparing with existing cache
+        let existing = self.get(&key, redis_prefix).await;
+        
+        let has_changed = match existing {
+            Some(cached) => {
+                // Compare the actual data (entries and result)
+                // We ignore cached_at timestamp for comparison
+                cached.entries != value.entries 
+                    || cached.result.code != value.result.code
+                    || cached.result.message != value.result.message
+                    || cached.ctrl != value.ctrl
+            }
+            None => {
+                // No existing cache, definitely changed
+                true
+            }
+        };
+
+        if has_changed {
+            debug!("Cache data has changed, updating");
+            self.set(key, value, redis_prefix, ttl).await;
+        } else {
+            debug!("Cache data unchanged, skipping Redis write");
+            // Still update L1 to refresh the entry
+            let mut cache = self.l1_cache.lock().unwrap();
+            
+            // Simple eviction if over size
+            if cache.len() >= self.max_l1_size {
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(&first_key);
+                }
+            }
+            
+            cache.insert(key, value);
+        }
+    }
 }
 
 async fn cache_get(
@@ -251,6 +288,32 @@ async fn cache_set(
             if let Some(tc) = tiered_cache {
                 tc.set(key, value, redis_prefix, ttl).await;
                 debug!("Updated tiered cache (L1 + L2)");
+            }
+        }
+    }
+}
+
+async fn cache_set_if_changed(
+    cache: &CacheBackend,
+    key: SearchCacheKey,
+    value: CachedValue,
+    redis_prefix: &str,
+    ttl: Option<u64>,
+    tiered_cache: &Option<Arc<TieredCache>>,
+) {
+    match cache {
+        CacheBackend::Memory(mem_cache) => {
+            let mut cache_write = mem_cache.write();
+            if let Some(cache_value_size) = NonZeroUsize::new(value.size()) {
+                debug!("Updating memory cache with entry of size {}", cache_value_size);
+                cache_write.insert_sized(key, value, cache_value_size);
+            } else {
+                error!("Invalid entry size, unable to add to memory cache");
+            }
+        }
+        CacheBackend::Redis(_) => {
+            if let Some(tc) = tiered_cache {
+                tc.set_if_changed(key, value, redis_prefix, ttl).await;
             }
         }
     }
@@ -449,7 +512,7 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                             ctrl: ctrl.clone(),
                         };
                         
-                        cache_set(
+                        cache_set_if_changed(
                             &app_state.cache,
                             cache_key.clone(),
                             cache_value,
