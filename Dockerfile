@@ -39,7 +39,9 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 
 # == end builder setup, we now have static artifacts.
 FROM run_base
-LABEL org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+ARG GITHUB_REPOSITORY
+LABEL org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}
 LABEL org.opencontainers.image.description="LDAP Fallback Proxy"
 LABEL org.opencontainers.image.licenses=MPL-2.0
 
