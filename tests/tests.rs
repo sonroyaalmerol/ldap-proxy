@@ -3,7 +3,7 @@
 use ldap3_proto::proto::LdapResult;
 use ldap_proxy::proxy::CachedValue;
 use ldap_proxy::Config;
-use std::time::Instant;
+use std::time::SystemTime;
 
 #[test]
 fn test_config_load() {
@@ -55,7 +55,7 @@ fn test_config_allow_all_bind_dns() {
 #[test]
 fn test_cachedvalue() {
     let cv = CachedValue {
-        cached_at: Instant::now(),
+        cached_at: SystemTime::now(),
         entries: Vec::with_capacity(5),
         result: LdapResult {
             code: ldap3_proto::LdapResultCode::Busy,
@@ -87,7 +87,7 @@ fn test_cachedvalue_size_calculation() {
     ));
     
     let cv = CachedValue {
-        cached_at: Instant::now(),
+        cached_at: SystemTime::now(),
         entries,
         result: LdapResult {
             code: ldap3_proto::LdapResultCode::Success,
@@ -149,4 +149,74 @@ fn test_remote_ip_addr_info_parsing() {
     
     let config = toml::from_str::<Config>(config_proxy).expect("Failed to parse config");
     assert!(matches!(config.remote_ip_addr_info, ldap_proxy::AddrInfoSource::ProxyV2));
+}
+
+#[test]
+fn test_cache_config_memory() {
+    let config_str = r#"
+        bind = "127.0.0.1:3636"
+        tls_chain = "/etc/ldap-proxy/chain.pem"
+        tls_key = "/etc/ldap-proxy/key.pem"
+        ldap_ca = "/etc/ldap-proxy/ldap-ca.pem"
+        ldap_url = "ldaps://ldap.example.com"
+        
+        [cache]
+        type = "memory"
+        size_bytes = 536870912
+    "#;
+    
+    let config = toml::from_str::<Config>(config_str).expect("Failed to parse config");
+    match config.cache {
+        ldap_proxy::CacheConfig::Memory { size_bytes } => {
+            assert_eq!(size_bytes, 536870912);
+        }
+        _ => panic!("Expected Memory cache config"),
+    }
+}
+
+#[test]
+fn test_cache_config_redis() {
+    let config_str = r#"
+        bind = "127.0.0.1:3636"
+        tls_chain = "/etc/ldap-proxy/chain.pem"
+        tls_key = "/etc/ldap-proxy/key.pem"
+        ldap_ca = "/etc/ldap-proxy/ldap-ca.pem"
+        ldap_url = "ldaps://ldap.example.com"
+        
+        [cache]
+        type = "redis"
+        url = "redis://localhost:6379"
+        ttl_seconds = 3600
+        key_prefix = "test_prefix:"
+    "#;
+    
+    let config = toml::from_str::<Config>(config_str).expect("Failed to parse config");
+    match config.cache {
+        ldap_proxy::CacheConfig::Redis { url, ttl_seconds, key_prefix } => {
+            assert_eq!(url, "redis://localhost:6379");
+            assert_eq!(ttl_seconds, Some(3600));
+            assert_eq!(key_prefix, "test_prefix:");
+        }
+        _ => panic!("Expected Redis cache config"),
+    }
+}
+
+#[test]
+fn test_cache_config_default() {
+    let config_str = r#"
+        bind = "127.0.0.1:3636"
+        tls_chain = "/etc/ldap-proxy/chain.pem"
+        tls_key = "/etc/ldap-proxy/key.pem"
+        ldap_ca = "/etc/ldap-proxy/ldap-ca.pem"
+        ldap_url = "ldaps://ldap.example.com"
+    "#;
+    
+    let config = toml::from_str::<Config>(config_str).expect("Failed to parse config");
+    // When no cache is specified, should use default (Memory with 256MB)
+    match config.cache {
+        ldap_proxy::CacheConfig::Memory { size_bytes } => {
+            assert_eq!(size_bytes, 268435456); // 256 MB
+        }
+        _ => panic!("Expected default Memory cache config"),
+    }
 }
