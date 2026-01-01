@@ -10,8 +10,6 @@ RUN zypper install -y cargo rust gcc libopenssl-3-devel sccache perl make gawk
 # // setup the runner pkgs
 FROM ref_repo AS run_base
 RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 openldap2-client
-COPY SUSE_CA_Root.pem /etc/pki/trust/anchors/
-RUN /usr/sbin/update-ca-certificates
 
 # // build artifacts
 FROM build_base AS builder
