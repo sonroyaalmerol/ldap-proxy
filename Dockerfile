@@ -1,26 +1,24 @@
-FROM opensuse/tumbleweed:latest AS ref_repo
+FROM debian:trixie-slim AS build_base
 
-RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
-    zypper --gpg-auto-import-keys ref --force
+RUN apt-get update && apt-get install -y \
+    cargo \
+    rustc \
+    gcc \
+    libssl-dev \
+    pkg-config \
+    perl \
+    make \
+    gawk \
+    && rm -rf /var/lib/apt/lists/*
 
-# // setup the builder pkgs
-FROM ref_repo AS build_base
-RUN zypper install -y cargo rust gcc libopenssl-3-devel sccache perl make gawk
-
-# // setup the runner pkgs
-FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 openldap2-client
-
-# // build artifacts
 FROM build_base AS builder
 
 ARG TARGETARCH
 ARG SCCACHE_REDIS
 
 COPY . /home/proxy/
-WORKDIR /home/proxy/opensuse-proxy-cache
+WORKDIR /home/proxy
 
-# Set RUSTFLAGS based on architecture
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
         export RUSTFLAGS="-Ctarget-cpu=x86-64-v3 --cfg tokio_unstable"; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
@@ -33,13 +31,22 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     RUST_BACKTRACE=full \
     cargo build --release
 
-# == end builder setup, we now have static artifacts.
-FROM run_base
+FROM debian:trixie-slim
 
 ARG GITHUB_REPOSITORY
 LABEL org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}
 LABEL org.opencontainers.image.description="LDAP Fallback Proxy"
 LABEL org.opencontainers.image.licenses=MPL-2.0
+
+RUN apt-get update && apt-get install -y \
+    sqlite3 \
+    openssl \
+    tzdata \
+    iputils-ping \
+    iproute2 \
+    ldap-utils \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 636
 WORKDIR /

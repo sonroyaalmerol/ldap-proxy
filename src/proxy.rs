@@ -6,11 +6,12 @@ use ldap3_proto::proto::*;
 use ldap3_proto::LdapCodec;
 use openssl::ssl::{Ssl, SslConnector};
 use redis::AsyncCommands;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{ReadHalf, WriteHalf};
@@ -79,8 +80,9 @@ fn bind_operror(msgid: i32, msg: &str) -> LdapMsg {
 
 // Tiered cache structure for Redis backend
 struct TieredCache {
-    l1_cache: quick_cache::sync::Cache<SearchCacheKey, CachedValue>,
+    l1_cache: Arc<Mutex<HashMap<SearchCacheKey, CachedValue>>>,
     redis_conn: redis::aio::MultiplexedConnection,
+    max_l1_size: usize,
 }
 
 impl TieredCache {
@@ -89,8 +91,9 @@ impl TieredCache {
         max_l1_size: usize,
     ) -> Self {
         Self {
-            l1_cache: quick_cache::sync::Cache::new(max_l1_size),
+            l1_cache: Arc::new(Mutex::new(HashMap::new())),
             redis_conn,
+            max_l1_size,
         }
     }
 
@@ -100,9 +103,12 @@ impl TieredCache {
         redis_prefix: &str,
     ) -> Option<CachedValue> {
         // Check L1 cache first
-        if let Some(value) = self.l1_cache.get(key) {
-            trace!("L1 cache hit");
-            return Some(value);
+        {
+            let cache = self.l1_cache.lock().unwrap();
+            if let Some(value) = cache.get(key) {
+                trace!("L1 cache hit");
+                return Some(value.clone());
+            }
         }
 
         // L1 miss, check Redis (L2)
@@ -114,8 +120,18 @@ impl TieredCache {
                 Ok(value) => {
                     trace!("L2 (Redis) cache hit, promoting to L1");
                     // Promote to L1 cache
-                    if let Some(size) = NonZeroUsize::new(value.size()) {
-                        self.l1_cache.insert_sized(key.clone(), value.clone(), size);
+                    {
+                        let mut cache = self.l1_cache.lock().unwrap();
+                        
+                        // Simple eviction if over size
+                        if cache.len() >= self.max_l1_size {
+                            // Remove oldest entry (simple FIFO eviction)
+                            if let Some(first_key) = cache.keys().next().cloned() {
+                                cache.remove(&first_key);
+                            }
+                        }
+                        
+                        cache.insert(key.clone(), value.clone());
                     }
                     Some(value)
                 }
@@ -146,22 +162,29 @@ impl TieredCache {
         ttl: Option<u64>,
     ) {
         // Write to L1 cache immediately
-        if let Some(size) = NonZeroUsize::new(value.size()) {
-            self.l1_cache.insert_sized(key.clone(), value.clone(), size);
+        {
+            let mut cache = self.l1_cache.lock().unwrap();
+            
+            // Simple eviction if over size
+            if cache.len() >= self.max_l1_size {
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(&first_key);
+                }
+            }
+            
+            cache.insert(key.clone(), value.clone());
         }
 
-
-        // Write to Redis synchronously but with timeout
+        // Write to Redis synchronously with timeout
         let redis_key = key.to_redis_key(redis_prefix);
         let mut conn = self.redis_conn.clone();
         
-        let timeout = Duration::from_millis(200);
+        let timeout = Duration::from_millis(100);
         let redis_write = async {
             match serde_json::to_vec(&value) {
                 Ok(data) => {
                     let result = if let Some(ttl_seconds) = ttl {
-                        conn.set_ex::<_, _, ()>(&redis_key, data, ttl_seconds)
-                            .await
+                        conn.set_ex::<_, _, ()>(&redis_key, data, ttl_seconds).await
                     } else {
                         conn.set::<_, _, ()>(&redis_key, data).await
                     };
@@ -173,14 +196,14 @@ impl TieredCache {
                     }
                 }
                 Err(e) => {
-                    error!(?e, "Failed to serialize for Redis");
+                    error!(?e, "Failed to serialize value for Redis");
                 }
             }
         };
 
         // Wait for Redis write with timeout
         if tokio::time::timeout(timeout, redis_write).await.is_err() {
-            warn!("Redis write timed out, continuing anyway");
+            warn!("Redis write timed out, continuing with L1 cache only");
         }
     }
 }
