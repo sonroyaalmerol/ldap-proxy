@@ -289,7 +289,7 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         warn!(?e, "Backend is unreachable, attempting to use fallback cache");
                         
                         // Try to get from fallback cache
-                        let cache_read_txn = app_state.cache.read();
+                        let mut cache_read_txn = app_state.cache.read();
                         match cache_read_txn.get(&cache_key) {
                             Some(cached_value) => {
                                 info!("Serving from fallback cache (cached at: {:?})", cached_value.cached_at);
