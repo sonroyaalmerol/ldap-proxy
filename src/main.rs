@@ -25,7 +25,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -33,7 +32,6 @@ use tokio_openssl::SslStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::span;
 use tracing_forest::{traits::*, util::*};
-// use tracing_forest::{traits::*, util::*};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/kanidm/ldap-proxy";
 
@@ -140,7 +138,7 @@ async fn ldaps_acceptor(
 }
 
 async fn setup(opt: &Opt) {
-    info!("Starting ldap-proxy");
+    info!("Starting ldap-proxy (fallback mode)");
 
     let mut f = match File::open(&opt.config) {
         Ok(f) => f,
@@ -177,8 +175,6 @@ async fn setup(opt: &Opt) {
     };
 
     debug!(?sync_config);
-
-    // Do we need to re-process the config to a different shape?
 
     // Setup the broadcast system.
     let (broadcast_tx, broadcast_rx) = broadcast::channel(1);
@@ -272,20 +268,22 @@ async fn setup(opt: &Opt) {
         return;
     }
 
-    // None for no cert verification
     tls_builder.set_verify(SslVerifyMode::PEER);
 
     let tls_params = tls_builder.build();
 
     let Some(cache) = ARCacheBuilder::new()
-        .set_size(sync_config.cache_bytes, 0)
+        .set_size(sync_config.fallback_cache_bytes, 0)
         .build()
     else {
-        error!("Unable to build query cache");
+        error!("Unable to build fallback cache");
         return;
     };
 
-    let cache_entry_timeout = Duration::from_secs(sync_config.cache_entry_timeout);
+    info!(
+        "Fallback cache configured with {} bytes",
+        sync_config.fallback_cache_bytes
+    );
 
     let max_incoming_ber_size = sync_config.max_incoming_ber_size;
     let max_proxy_ber_size = sync_config.max_proxy_ber_size;
@@ -297,7 +295,6 @@ async fn setup(opt: &Opt) {
         addrs,
         binddn_map: sync_config.binddn_map.clone(),
         cache,
-        cache_entry_timeout,
         max_incoming_ber_size,
         max_proxy_ber_size,
         allow_all_bind_dns,

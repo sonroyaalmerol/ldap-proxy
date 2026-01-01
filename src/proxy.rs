@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{ReadHalf, WriteHalf};
@@ -31,7 +30,7 @@ pub struct SearchCacheKey {
 
 #[derive(Debug, Clone)]
 pub struct CachedValue {
-    pub valid_until: Instant,
+    pub cached_at: Instant,
     pub entries: Vec<(LdapSearchResultEntry, Vec<LdapControl>)>,
     pub result: LdapResult,
     pub ctrl: Vec<LdapControl>,
@@ -252,25 +251,7 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     }
                 };
 
-                // This is done like this to facilitate a cache mechanism in future.
-                //
-                // Cache will need to key on:
-                //    bind_dn
-                //    base
-                //    scope
-                //    deref aliases
-                //    types only
-                //    filter
-                //    attrs
-                //   search controls
-                //
-                // Which is a lot, but it's everything that controls to results to
-                // ensure we don't introduce corruption.
-
                 let now = Instant::now();
-
-                // get the read txn.
-                let mut cache_read_txn = app_state.cache.read();
 
                 let cache_key = SearchCacheKey {
                     bind_dn: dn.clone(),
@@ -279,57 +260,64 @@ pub async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 };
                 debug!(?cache_key);
 
-                let maybe_results = cache_read_txn.get(&cache_key).and_then(|cache_value| {
-                    if cache_value.valid_until > now {
-                        Some(cache_value.clone())
-                    } else {
-                        debug!("Cache item expired");
-                        None
+                // Always try to get fresh data from backend first
+                let (entries, result, ctrl) = match client.search(sr, ctrl).await {
+                    Ok(data) => {
+                        info!("Backend is reachable, updating fallback cache");
+                        let (entries, result, ctrl) = data;
+                        
+                        // Update fallback cache with fresh data
+                        let mut cache_write_txn = app_state.cache.write();
+                        let cache_value = CachedValue {
+                            cached_at: now,
+                            entries: entries.clone(),
+                            result: result.clone(),
+                            ctrl: ctrl.clone(),
+                        };
+                        
+                        if let Some(cache_value_size) = NonZeroUsize::new(cache_value.size()) {
+                            debug!("Updating fallback cache with entry of size {}", cache_value_size);
+                            cache_write_txn.insert_sized(cache_key.clone(), cache_value, cache_value_size);
+                        } else {
+                            error!("Invalid entry size, unable to add to fallback cache");
+                        }
+                        
+                        (entries, result, ctrl)
                     }
-                });
-
-                let was_cache_miss = maybe_results.is_none();
-
-                debug!("cache hit {}", !was_cache_miss);
-
-                let (entries, result, ctrl) = match maybe_results {
-                    Some(CachedValue {
-                        valid_until: _,
-                        entries,
-                        result,
-                        ctrl,
-                    }) => (entries, result, ctrl),
-                    None => {
-                        match client.search(sr, ctrl).await {
-                            Ok(data) => data,
-                            Err(e) => {
-                                error!(?e, "A client search error has occurred");
-                                let resp_msg = bind_operror(msgid, "unable to search");
+                    Err(e) => {
+                        warn!(?e, "Backend is unreachable, attempting to use fallback cache");
+                        
+                        // Try to get from fallback cache
+                        let cache_read_txn = app_state.cache.read();
+                        match cache_read_txn.get(&cache_key) {
+                            Some(cached_value) => {
+                                info!("Serving from fallback cache (cached at: {:?})", cached_value.cached_at);
+                                (
+                                    cached_value.entries.clone(),
+                                    cached_value.result.clone(),
+                                    cached_value.ctrl.clone(),
+                                )
+                            }
+                            None => {
+                                error!("Backend unreachable and no fallback data available");
+                                let resp_msg = LdapMsg {
+                                    msgid,
+                                    op: LdapOp::SearchResultDone(LdapResult {
+                                        code: LdapResultCode::Unavailable,
+                                        matcheddn: "".to_string(),
+                                        message: "Backend LDAP server unavailable and no cached data".to_string(),
+                                        referral: vec![],
+                                    }),
+                                    ctrl: vec![],
+                                };
                                 if w.send(resp_msg).await.is_err() {
                                     error!("Unable to send response");
                                 }
-                                // Always bail.
                                 break;
                             }
                         }
                     }
                 };
-
-                // Update cache if needed.
-                if was_cache_miss {
-                    let cache_value = CachedValue {
-                        valid_until: now + app_state.cache_entry_timeout,
-                        entries: entries.clone(),
-                        result: result.clone(),
-                        ctrl: ctrl.clone(),
-                    };
-                    if let Some(cache_value_size) = NonZeroUsize::new(cache_value.size()) {
-                        debug!("Adding entry of size {} to cache", cache_value_size);
-                        cache_read_txn.insert_sized(cache_key, cache_value, cache_value_size);
-                    } else {
-                        error!("Invalid entry size, unable to add to cache");
-                    }
-                }
 
                 for (entry, ctrl) in entries {
                     if w.send(LdapMsg {

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 use url::Url;
 
 pub mod proxy;
@@ -21,10 +20,9 @@ const MEGABYTES: usize = 1048576;
 pub struct AppState {
     pub tls_params: SslConnector,
     pub addrs: Vec<SocketAddr>,
-    // Cache later here.
+    // Fallback cache - never expires until backend is reachable
     pub binddn_map: BTreeMap<String, DnConfig>,
     pub cache: ARCache<SearchCacheKey, CachedValue>,
-    pub cache_entry_timeout: Duration,
     pub max_incoming_ber_size: Option<usize>,
     pub max_proxy_ber_size: Option<usize>,
     pub allow_all_bind_dns: bool,
@@ -52,12 +50,8 @@ impl FromStr for LdapFilterWrapper {
     }
 }
 
-fn default_cache_bytes() -> usize {
-    128 * MEGABYTES
-}
-
-fn default_cache_entry_timeout() -> u64 {
-    1800
+fn default_fallback_cache_bytes() -> usize {
+    256 * MEGABYTES
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -73,10 +67,8 @@ pub struct Config {
     pub tls_key: PathBuf,
     pub tls_chain: PathBuf,
 
-    #[serde(default = "default_cache_bytes")]
-    pub cache_bytes: usize,
-    #[serde(default = "default_cache_entry_timeout")]
-    pub cache_entry_timeout: u64,
+    #[serde(default = "default_fallback_cache_bytes")]
+    pub fallback_cache_bytes: usize,
 
     pub ldap_ca: PathBuf,
     pub ldap_url: Url,
