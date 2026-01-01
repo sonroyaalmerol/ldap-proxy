@@ -18,8 +18,6 @@ ARG TARGETARCH
 ARG SCCACHE_REDIS
 
 COPY . /home/proxy/
-RUN mkdir -p /home/proxy/.cargo
-COPY cargo_config /home/proxy/.cargo/config
 WORKDIR /home/proxy/opensuse-proxy-cache
 
 # Set RUSTFLAGS based on architecture
